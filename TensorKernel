@@ -1,0 +1,230 @@
+#ifndef TENSOR_GRAVITY_KERNEL_OPTIMIZED_H
+#define TENSOR_GRAVITY_KERNEL_OPTIMIZED_H
+
+#include <experimental/simd>
+#include <array>
+#include <cmath>
+#include <limits>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+namespace stdx = std::experimental;
+
+template <typename T = double>
+struct TensorGravityKernelOptimized {
+    using abi_type = stdx::simd_abi::native<T>;
+    using simd_t = stdx::simd<T, abi_type>;
+    using simd_mask_t = typename simd_t::mask_type;
+    static constexpr int simd_width = simd_t::size();
+
+    // ═════════════════════════════════════════════════════════════════
+    // COEFFICIENT BUNDLE - All regimes preassembled, loaded once
+    // ═════════════════════════════════════════════════════════════════
+
+    struct CoefficientBundle {
+        // Regime A: Potential f(r)
+        simd_t a_f_c0, a_f_c2, a_f_c4, a_f_c5;
+
+        // Regime A: Acceleration g(r)
+        simd_t a_g_c0, a_g_c2, a_g_c3;
+
+        // Regime B: Potential f(r)
+        simd_t b_f_c0, b_f_c2, b_f_c3, b_f_c4, b_f_c5;
+        simd_t b_f_inv_u;  // -1/15 term for 1/u singularity
+
+        // Regime B: Acceleration g(r)
+        simd_t b_g_c0, b_g_c1, b_g_c2, b_g_c3;
+        simd_t b_g_const;  // -1/15 constant
+
+        // Constructor: Runtime initialization (simd_t not constexpr)
+        CoefficientBundle() :
+            a_f_c0(7.0 / 5.0), a_f_c2(-2.0 / 3.0), a_f_c4(3.0 / 10.0), a_f_c5(-1.0 / 10.0),
+            a_g_c0(4.0 / 3.0), a_g_c2(-6.0 / 5.0), a_g_c3(1.0 / 2.0),
+            b_f_c0(8.0 / 5.0), b_f_c2(-4.0 / 3.0), b_f_c3(1.0),
+            b_f_c4(-3.0 / 10.0), b_f_c5(1.0 / 30.0), b_f_inv_u(-1.0 / 15.0),
+            b_g_c0(8.0 / 3.0), b_g_c1(-3.0), b_g_c2(6.0 / 5.0), b_g_c3(-1.0 / 6.0),
+            b_g_const(-1.0 / 15.0)
+        { }
+    };
+
+    // Static singleton instance (initialized once, reused for all batches)
+    static const CoefficientBundle COEFF;
+
+    // ═════════════════════════════════════════════════════════════════
+    // POWER BASIS - Powers of u, cached inverse powers, regime selector
+    // ═════════════════════════════════════════════════════════════════
+
+    struct PowerBasis {
+        simd_t u1, u2, u3, u4, u5, u6, u7, inv_u;
+        simd_t inv_r;      // Cached 1/r
+        simd_t inv_r3;     // Cached 1/r³
+        simd_t selector;   // Regime selector: 0.0=A, 1.0=B, 2.0=C, NaN=absorb to C
+        simd_t mask_a, mask_b, mask_c;  // Binary masks (0.0/1.0) for regime selection
+    };
+
+    static PowerBasis compute_power_basis(simd_t u, simd_t inv_r, simd_t inv_twoh, simd_t selector) {
+        PowerBasis basis;
+
+        // Compute powers in parallel-efficient order for ILP
+        basis.u1 = u;
+        basis.u2 = u * u;
+        basis.u4 = basis.u2 * basis.u2;
+        basis.u3 = basis.u2 * u;
+        basis.u5 = basis.u4 * u;
+        basis.u6 = basis.u4 * basis.u2;
+        basis.u7 = basis.u6 * u;
+        basis.inv_u = inv_r * inv_twoh;
+
+        // Cache inverse powers (single computation, multiple uses)
+        basis.inv_r = inv_r;
+        basis.inv_r3 = inv_r * inv_r * inv_r;
+
+        // Compute regime masks from selector
+        basis.selector = selector;
+        basis.mask_a = simd_t(0.0);
+        basis.mask_b = simd_t(0.0);
+        basis.mask_c = simd_t(0.0);
+
+        simd_mask_t is_regime_a = (selector == simd_t(0.0));
+        simd_mask_t is_regime_b = (selector == simd_t(1.0));
+        simd_mask_t is_regime_c_or_nan = !is_regime_a && !is_regime_b;
+
+        stdx::where(is_regime_a, basis.mask_a) = 1.0;
+        stdx::where(is_regime_b, basis.mask_b) = 1.0;
+        stdx::where(is_regime_c_or_nan, basis.mask_c) = 1.0;
+
+        return basis;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // Distance calculations - Pure SIMD
+    // ═════════════════════════════════════════════════════════════════
+
+    static inline simd_t simd_sqrt(simd_t x) {
+        return stdx::sqrt(x);
+    }
+
+    static inline simd_t simd_rsqrt(simd_t x) {
+        return 1.0 / stdx::sqrt(x);
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // Horner polynomial evaluations (FMA chains for all 3 regimes)
+    // ═════════════════════════════════════════════════════════════════
+
+    // Regime A: Inner spline (u < 1.0)
+    static simd_t eval_a_potential(const PowerBasis& basis, simd_t dih, const CoefficientBundle& coeff) {
+        simd_t inner = coeff.a_f_c5 * basis.u1 + coeff.a_f_c4;
+        inner = inner * basis.u2 + coeff.a_f_c2;
+        return dih * (inner * basis.u2 + coeff.a_f_c0);
+    }
+
+    static simd_t eval_a_accel(const PowerBasis& basis, simd_t dih, const CoefficientBundle& coeff) {
+        simd_t dih3 = dih * dih * dih;
+        simd_t inner = coeff.a_g_c3 * basis.u1 + coeff.a_g_c2;
+        return dih3 * (inner * basis.u2 + coeff.a_g_c0);
+    }
+
+    // Regime B: Transition with 1/r singularity (1.0 ≤ u < 2.0)
+    static simd_t eval_b_potential(const PowerBasis& basis, simd_t dih,
+                                   const CoefficientBundle& coeff) {
+        simd_t inner = coeff.b_f_c5 * basis.u1 + coeff.b_f_c4;
+        inner = inner * basis.u1 + coeff.b_f_c3;
+        inner = inner * basis.u1 + coeff.b_f_c2;
+        simd_t poly = dih * (inner * basis.u2 + coeff.b_f_c0);
+        simd_t singular = coeff.b_f_inv_u * basis.inv_r;
+        return poly + singular;
+    }
+
+    static simd_t eval_b_accel(const PowerBasis& basis, simd_t dih,
+                               const CoefficientBundle& coeff) {
+        simd_t dih3 = dih * dih * dih;
+        simd_t inner = coeff.b_g_c3 * basis.u1 + coeff.b_g_c2;
+        inner = inner * basis.u1 + coeff.b_g_c1;
+        simd_t poly = dih3 * (inner * basis.u1 + coeff.b_g_c0);
+        simd_t singular = coeff.b_g_const * basis.inv_r3;
+        return singular + poly;
+    }
+
+    // Regime C: Newtonian (u ≥ 2.0)
+    static simd_t eval_c_potential(const PowerBasis& basis) {
+        return basis.inv_r;
+    }
+
+    static simd_t eval_c_accel(const PowerBasis& basis) {
+        return basis.inv_r3;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // Matrix blend: select regime via precomputed masks
+    // Result = regime_a * mask_a + regime_b * mask_b + regime_c * mask_c
+    // ═════════════════════════════════════════════════════════════════
+
+    static simd_t eval_potential_matrix(const PowerBasis& basis, simd_t dih,
+                                       const CoefficientBundle& coeff) {
+        simd_t a_pot = eval_a_potential(basis, dih, coeff);
+        simd_t b_pot = eval_b_potential(basis, dih, coeff);
+        simd_t c_pot = eval_c_potential(basis);
+        return a_pot * basis.mask_a + b_pot * basis.mask_b + c_pot * basis.mask_c;
+    }
+
+    static simd_t eval_accel_matrix(const PowerBasis& basis, simd_t dih,
+                                   const CoefficientBundle& coeff) {
+        simd_t a_acc = eval_a_accel(basis, dih, coeff);
+        simd_t b_acc = eval_b_accel(basis, dih, coeff);
+        simd_t c_acc = eval_c_accel(basis);
+        return a_acc * basis.mask_a + b_acc * basis.mask_b + c_acc * basis.mask_c;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // Main kernel entry point
+    // ═════════════════════════════════════════════════════════════════
+
+    static void compute_batch(const simd_t* r2_array, const simd_t* twoh_array,
+                             simd_t* a_out, simd_t* b_out, size_t num_simd_batches) {
+        const CoefficientBundle& coeff = COEFF;
+        simd_t inv_2 = simd_t(0.5);
+
+#pragma omp parallel for schedule(dynamic, 32) if (num_simd_batches > 4)
+        for (size_t b = 0; b < num_simd_batches; ++b) {
+            simd_t r2 = r2_array[b];
+            simd_t twoh = twoh_array[b];
+
+            simd_mask_t is_self = (r2 == simd_t(0.0));
+
+            simd_t r = simd_sqrt(r2);
+            simd_t inv_r = simd_rsqrt(r2);
+
+            simd_t dih = simd_t(2.0) / twoh;
+            simd_t u = r * dih;
+
+            // Regime selector via vectorized where-if trees
+            simd_t selector = simd_t(2.0);  // Default: regime C (Newtonian)
+
+            simd_mask_t is_regime_a = (u < simd_t(1.0));
+            simd_mask_t is_regime_b = (u >= simd_t(1.0)) && (u < simd_t(2.0));
+
+            stdx::where(is_regime_a, selector) = simd_t(0.0);
+            stdx::where(is_regime_b, selector) = simd_t(1.0);
+            stdx::where(is_self, selector) = std::numeric_limits<T>::quiet_NaN();
+
+            PowerBasis basis = compute_power_basis(u, inv_r, inv_2, selector);
+
+            simd_t a_final = eval_potential_matrix(basis, dih, coeff);
+            simd_t b_final = eval_accel_matrix(basis, dih, coeff);
+
+            a_out[b] = a_final;
+            b_out[b] = b_final;
+        }
+    }
+};
+
+// Static coefficient bundle definitions (one per template instantiation)
+template <typename T>
+const typename TensorGravityKernelOptimized<T>::CoefficientBundle
+    TensorGravityKernelOptimized<T>::COEFF;
+
+#endif  // TENSOR_GRAVITY_KERNEL_OPTIMIZED_H
+//IP:AMF
